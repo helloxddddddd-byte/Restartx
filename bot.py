@@ -1,171 +1,191 @@
+import os
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
+from discord import app_commands
 import aiohttp
 import asyncio
 import json
-import os
 from flask import Flask
 from threading import Thread
 
-# ---------------- CONFIG ---------------- #
-CONFIG_FILE = "config.json"
-TOKEN = os.getenv("DISCORD_TOKEN")  # put your bot token in environment vars
-WHITELIST = [123456789012345678]  # whitelist user IDs (replace with yours)
-
-# ---------------- HELPERS ---------------- #
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        return {}
-    with open(CONFIG_FILE, "r") as f:
-        return json.load(f)
-
-def save_config(data):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-config = load_config()
-
+TOKEN = os.getenv("DISCORD_TOKEN")
+PREFIX = "!"
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
+intents.message_content = True  # Needed for ! commands
 
-active_tasks = {}  # guild_id -> task
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+tree = bot.tree  # for slash commands
 
-
-async def fetch_game_stats(universe_id: str):
-    """Fetches live Roblox game stats (playing + visits)."""
-    async with aiohttp.ClientSession() as session:
-        try:
-            url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
-            async with session.get(url) as resp:
-                data = await resp.json()
-                visits = data["data"][0]["visits"]
-                playing = data["data"][0]["playing"]
-                return playing, visits
-        except Exception:
-            return 0, 0
-
-
-async def spam_stats(guild_id, channel_id, universe_id):
-    """Loop that spams stats every 65 seconds."""
-    await bot.wait_until_ready()
-    channel = bot.get_channel(channel_id)
-    if not channel:
-        return
-
-    while True:
-        playing, visits = await fetch_game_stats(universe_id)
-        milestone = visits + 100
-        try:
-            await channel.send(
-                f"🎮 **Game Stats** 🎮\n"
-                f"👥 Players Online: **{playing}**\n"
-                f"👀 Visits: **{visits:,}**\n"
-                f"🎯 Next Milestone: **{milestone:,} visits**"
-            )
-        except Exception:
-            pass
-        await asyncio.sleep(65)
-
-
-# ---------------- COMMANDS ---------------- #
-
-def is_whitelisted():
-    async def predicate(ctx):
-        return ctx.author.id in WHITELIST
-    return commands.check(predicate)
-
-
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
-    try:
-        synced = await tree.sync()
-        print(f"🔗 Synced {len(synced)} commands")
-    except Exception as e:
-        print(f"❌ Sync failed: {e}")
-
-
-@bot.hybrid_command(name="setgame")
-@is_whitelisted()
-async def setgame(ctx, universe_id: str):
-    """Set which Roblox game (universe_id) to track."""
-    gid = str(ctx.guild.id)
-    if gid not in config:
-        config[gid] = {}
-    config[gid]["universe_id"] = universe_id
-    save_config(config)
-    await ctx.reply(f"✅ Game set to **{universe_id}**")
-
-
-@bot.hybrid_command(name="setchannel")
-@is_whitelisted()
-async def setchannel(ctx):
-    """Set the current channel for stats spam."""
-    gid = str(ctx.guild.id)
-    if gid not in config:
-        config[gid] = {}
-    config[gid]["channel_id"] = ctx.channel.id
-    save_config(config)
-    await ctx.reply(f"✅ Channel set to {ctx.channel.mention}")
-
-
-@bot.hybrid_command(name="start")
-@is_whitelisted()
-async def start(ctx):
-    """Start sending stats in this server."""
-    gid = str(ctx.guild.id)
-    if gid not in config or "universe_id" not in config[gid] or "channel_id" not in config[gid]:
-        await ctx.reply("⚠️ Please run `/setgame <id>` and `/setchannel` first.")
-        return
-
-    if gid in active_tasks:
-        await ctx.reply("⚠️ Stats are already running here.")
-        return
-
-    task = asyncio.create_task(spam_stats(int(gid), config[gid]["channel_id"], config[gid]["universe_id"]))
-    active_tasks[gid] = task
-    await ctx.reply("✅ Stats updates **started**!")
-
-
-@bot.hybrid_command(name="stop")
-@is_whitelisted()
-async def stop(ctx):
-    """Stop sending stats in this server."""
-    gid = str(ctx.guild.id)
-    if gid in active_tasks:
-        active_tasks[gid].cancel()
-        del active_tasks[gid]
-        await ctx.reply("🛑 Stats updates **stopped**!")
-    else:
-        await ctx.reply("⚠️ No stats running in this server.")
-
-
-@bot.hybrid_command(name="commands")
-@is_whitelisted()
-async def commands_list(ctx):
-    """Show available bot commands."""
-    cmds = [
-        "/setgame <universe_id> - Set which Roblox game to track",
-        "/setchannel - Choose channel for stats",
-        "/start - Start sending stats",
-        "/stop - Stop sending stats",
-        "/commands - Show this list"
-    ]
-    await ctx.reply("📜 **Available Commands:**\n" + "\n".join(cmds))
-
-
-# ---------------- FLASK KEEP-ALIVE ---------------- #
+# ----------------- Flask Keep-Alive -----------------
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Bot is running!"
 
-def run_flask():
+def run():
     app.run(host="0.0.0.0", port=8080)
 
-Thread(target=run_flask).start()
+Thread(target=run).start()
 
-# ---------------- RUN ---------------- #
+# ----------------- Whitelist -----------------
+CONFIG_FILE = "config.json"
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "w") as f:
+            json.dump({"whitelist": [], "servers": {}}, f)
+    with open(CONFIG_FILE, "r") as f:
+        return json.load(f)
+
+def save_config(cfg):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=4)
+
+config = load_config()
+
+def is_whitelisted(user_id):
+    return str(user_id) in config["whitelist"]
+
+# ----------------- Roblox Fetching -----------------
+async def fetch_game_data(place_id):
+    async with aiohttp.ClientSession() as session:
+        # visits
+        async with session.get(f"https://games.roblox.com/v1/games?universeIds={place_id}") as r:
+            data = await r.json()
+            visits = data["data"][0]["visits"] if "data" in data else 0
+
+        # active players (sum across servers)
+        active = 0
+        async with session.get(f"https://games.roblox.com/v1/games/{place_id}/servers/Public?sortOrder=Asc&limit=100") as r:
+            servers = await r.json()
+            if "data" in servers:
+                for s in servers["data"]:
+                    active += s.get("playing", 0)
+
+        return active, visits
+
+# ----------------- Background Task -----------------
+tasks_running = {}
+
+@tasks.loop(seconds=65)
+async def stats_loop(guild_id):
+    cfg = load_config()
+    server_cfg = cfg["servers"].get(str(guild_id))
+    if not server_cfg:
+        return
+    channel_id = server_cfg.get("channel_id")
+    place_id = server_cfg.get("place_id")
+
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return
+
+    active, visits = await fetch_game_data(place_id)
+    milestone = visits + 100
+
+    msg = (
+        "--------------------------------------------------\n"
+        f"👤🎮 Active players: {active}\n"
+        "--------------------------------------------------\n"
+        f"👥 Visits: {visits}\n"
+        f"🎯 Next milestone: {milestone}\n"
+        "--------------------------------------------------"
+    )
+    await channel.send(msg)
+
+# ----------------- Commands -----------------
+@bot.event
+async def on_ready():
+    await bot.tree.sync()  # force sync slash commands
+    print(f"✅ Logged in as {bot.user} and synced commands")
+
+# start
+@bot.command()
+async def start(ctx):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted!")
+    guild_id = ctx.guild.id
+    if guild_id not in tasks_running:
+        tasks_running[guild_id] = stats_loop.start(guild_id)
+        await ctx.send("✅ Stats updates started!")
+
+@tree.command(name="start", description="Start tracking stats")
+async def start_slash(interaction: discord.Interaction):
+    if not is_whitelisted(interaction.user.id):
+        return await interaction.response.send_message("❌ You are not whitelisted!", ephemeral=True)
+    guild_id = interaction.guild.id
+    if guild_id not in tasks_running:
+        tasks_running[guild_id] = stats_loop.start(guild_id)
+        await interaction.response.send_message("✅ Stats updates started!")
+
+# stop
+@bot.command()
+async def stop(ctx):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted!")
+    guild_id = ctx.guild.id
+    if guild_id in tasks_running:
+        tasks_running[guild_id].cancel()
+        del tasks_running[guild_id]
+        await ctx.send("🛑 Stats updates stopped!")
+
+@tree.command(name="stop", description="Stop tracking stats")
+async def stop_slash(interaction: discord.Interaction):
+    if not is_whitelisted(interaction.user.id):
+        return await interaction.response.send_message("❌ You are not whitelisted!", ephemeral=True)
+    guild_id = interaction.guild.id
+    if guild_id in tasks_running:
+        tasks_running[guild_id].cancel()
+        del tasks_running[guild_id]
+        await interaction.response.send_message("🛑 Stats updates stopped!")
+
+# set channel
+@bot.command()
+async def setchannel(ctx):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted!")
+    cfg = load_config()
+    cfg["servers"][str(ctx.guild.id)] = cfg["servers"].get(str(ctx.guild.id), {})
+    cfg["servers"][str(ctx.guild.id)]["channel_id"] = ctx.channel.id
+    save_config(cfg)
+    await ctx.send(f"✅ Channel set to {ctx.channel.mention}")
+
+# set game
+@bot.command()
+async def setgame(ctx, place_id: int):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted!")
+    cfg = load_config()
+    cfg["servers"][str(ctx.guild.id)] = cfg["servers"].get(str(ctx.guild.id), {})
+    cfg["servers"][str(ctx.guild.id)]["place_id"] = place_id
+    save_config(cfg)
+    await ctx.send(f"✅ Game set to place ID: {place_id}")
+
+# whitelist
+@bot.command()
+async def whitelist(ctx, user_id: int):
+    if ctx.author.id != 893232409489866782:
+        return await ctx.send("❌ Only the owner can whitelist users!")
+    config = load_config()
+    if str(user_id) not in config["whitelist"]:
+        config["whitelist"].append(str(user_id))
+        save_config(config)
+    await ctx.send(f"✅ User <@{user_id}> whitelisted!")
+
+# commands list
+@bot.command()
+async def commandslist(ctx):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted!")
+    cmds = [
+        "!start / /start - Start tracking",
+        "!stop / /stop - Stop tracking",
+        "!setchannel - Set channel for updates",
+        "!setgame <place_id> - Set game to track",
+        "!whitelist <user_id> - Add a user to whitelist",
+        "!commandslist - Show all commands"
+    ]
+    await ctx.send("📜 **Commands:**\n" + "\n".join(cmds))
+
 bot.run(TOKEN)
