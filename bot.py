@@ -1,144 +1,171 @@
-import os
-import asyncio
-import aiohttp
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
+import aiohttp
+import asyncio
+import json
+import os
+from flask import Flask
+from threading import Thread
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID"))  # server where slash cmds sync
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))  # channel for updates
-PLACE_ID = int(os.getenv("PLACE_ID"))  # your game's placeId
-UNIVERSE_ID = int(os.getenv("UNIVERSE_ID"))  # your game's universeId
-WHITELIST = set(int(x) for x in os.getenv("WHITELIST", "").split(",") if x)
+# ---------------- CONFIG ---------------- #
+CONFIG_FILE = "config.json"
+TOKEN = os.getenv("DISCORD_TOKEN")  # put your bot token in environment vars
+WHITELIST = [123456789012345678]  # whitelist user IDs (replace with yours)
+
+# ---------------- HELPERS ---------------- #
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    with open(CONFIG_FILE, "r") as f:
+        return json.load(f)
+
+def save_config(data):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+config = load_config()
 
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix=commands.when_mentioned_or("/", "!"), intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-sending_updates = False
-session: aiohttp.ClientSession = None
+active_tasks = {}  # guild_id -> task
 
-# -------- Roblox API Helpers -------- #
-async def get_game_stats():
-    global session
-    if session is None or session.closed:
-        session = aiohttp.ClientSession()
 
-    # Visits
-    visits = 0
-    async with session.get(f"https://games.roblox.com/v1/games?universeIds={UNIVERSE_ID}") as r:
-        if r.status == 200:
-            data = await r.json()
-            if "data" in data and len(data["data"]) > 0:
+async def fetch_game_stats(universe_id: str):
+    """Fetches live Roblox game stats (playing + visits)."""
+    async with aiohttp.ClientSession() as session:
+        try:
+            url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
+            async with session.get(url) as resp:
+                data = await resp.json()
                 visits = data["data"][0]["visits"]
+                playing = data["data"][0]["playing"]
+                return playing, visits
+        except Exception:
+            return 0, 0
 
-    # Players across all servers
-    players = 0
-    cursor = ""
+
+async def spam_stats(guild_id, channel_id, universe_id):
+    """Loop that spams stats every 65 seconds."""
+    await bot.wait_until_ready()
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return
+
     while True:
-        url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public?sortOrder=Asc&limit=100"
-        if cursor:
-            url += f"&cursor={cursor}"
-        async with session.get(url) as r:
-            if r.status != 200:
-                break
-            data = await r.json()
-            for server in data.get("data", []):
-                players += server.get("playing", 0)
-            cursor = data.get("nextPageCursor")
-            if not cursor:
-                break
-        await asyncio.sleep(1)  # ✅ avoid hammering Roblox
-
-    return visits, players
-
-# -------- Background Loop -------- #
-@tasks.loop(seconds=65)
-async def post_stats():
-    if not sending_updates:
-        return
-    try:
-        visits, players = await get_game_stats()
-        channel = bot.get_channel(CHANNEL_ID)
-        if channel:
-            milestone = visits + 100
+        playing, visits = await fetch_game_stats(universe_id)
+        milestone = visits + 100
+        try:
             await channel.send(
-                f"📊 **Game Stats**\n"
-                f"👥 Players Online: **{players}**\n"
-                f"👣 Total Visits: **{visits}**\n"
-                f"🎯 Next Milestone: **{milestone}**"
+                f"🎮 **Game Stats** 🎮\n"
+                f"👥 Players Online: **{playing}**\n"
+                f"👀 Visits: **{visits:,}**\n"
+                f"🎯 Next Milestone: **{milestone:,} visits**"
             )
-    except Exception as e:
-        print(f"Error posting stats: {e}")
+        except Exception:
+            pass
+        await asyncio.sleep(65)
 
-# -------- Whitelist Helpers -------- #
-def is_whitelisted_slash(interaction: discord.Interaction) -> bool:
-    return interaction.user.id in WHITELIST
 
-# -------- Slash Commands -------- #
-@tree.command(name="start", description="Start updates")
-async def start_slash(interaction: discord.Interaction):
-    if not is_whitelisted_slash(interaction):
-        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
-        return
-    global sending_updates
-    sending_updates = True
-    await interaction.response.defer()
-    await interaction.followup.send("✅ Stats updates **started**!")
+# ---------------- COMMANDS ---------------- #
 
-@tree.command(name="stop", description="Stop updates")
-async def stop_slash(interaction: discord.Interaction):
-    if not is_whitelisted_slash(interaction):
-        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
-        return
-    global sending_updates
-    sending_updates = False
-    await interaction.response.defer()
-    await interaction.followup.send("🛑 Stats updates **stopped**.")
+def is_whitelisted():
+    async def predicate(ctx):
+        return ctx.author.id in WHITELIST
+    return commands.check(predicate)
 
-@tree.command(name="restart", description="Restart updates")
-async def restart_slash(interaction: discord.Interaction):
-    if not is_whitelisted_slash(interaction):
-        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
-        return
-    global sending_updates
-    sending_updates = False
-    await asyncio.sleep(1)
-    sending_updates = True
-    await interaction.response.defer()
-    await interaction.followup.send("🔄 Stats updates **restarted**.")
 
-@tree.command(name="whitelist", description="Add a user to whitelist")
-async def whitelist_slash(interaction: discord.Interaction, user: discord.User):
-    if not is_whitelisted_slash(interaction):
-        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
-        return
-    WHITELIST.add(user.id)
-    await interaction.response.defer(ephemeral=True)
-    await interaction.followup.send(f"✅ {user.mention} added to whitelist.", ephemeral=True)
-
-@tree.command(name="helpme", description="Show available commands")
-async def helpme_slash(interaction: discord.Interaction):
-    if not is_whitelisted_slash(interaction):
-        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    cmds = ["/start", "/stop", "/restart", "/whitelist <user>", "/helpme"]
-    await interaction.followup.send("📖 **Available Commands:**\n" + "\n".join(cmds), ephemeral=True)
-
-# -------- Startup -------- #
 @bot.event
 async def on_ready():
-    global session
-    if session is None or session.closed:
-        session = aiohttp.ClientSession()
-    post_stats.start()
-    await tree.sync(guild=discord.Object(id=GUILD_ID))
     print(f"✅ Logged in as {bot.user}")
+    try:
+        synced = await tree.sync()
+        print(f"🔗 Synced {len(synced)} commands")
+    except Exception as e:
+        print(f"❌ Sync failed: {e}")
 
-async def close_session():
-    global session
-    if session and not session.closed:
-        await session.close()
 
+@bot.hybrid_command(name="setgame")
+@is_whitelisted()
+async def setgame(ctx, universe_id: str):
+    """Set which Roblox game (universe_id) to track."""
+    gid = str(ctx.guild.id)
+    if gid not in config:
+        config[gid] = {}
+    config[gid]["universe_id"] = universe_id
+    save_config(config)
+    await ctx.reply(f"✅ Game set to **{universe_id}**")
+
+
+@bot.hybrid_command(name="setchannel")
+@is_whitelisted()
+async def setchannel(ctx):
+    """Set the current channel for stats spam."""
+    gid = str(ctx.guild.id)
+    if gid not in config:
+        config[gid] = {}
+    config[gid]["channel_id"] = ctx.channel.id
+    save_config(config)
+    await ctx.reply(f"✅ Channel set to {ctx.channel.mention}")
+
+
+@bot.hybrid_command(name="start")
+@is_whitelisted()
+async def start(ctx):
+    """Start sending stats in this server."""
+    gid = str(ctx.guild.id)
+    if gid not in config or "universe_id" not in config[gid] or "channel_id" not in config[gid]:
+        await ctx.reply("⚠️ Please run `/setgame <id>` and `/setchannel` first.")
+        return
+
+    if gid in active_tasks:
+        await ctx.reply("⚠️ Stats are already running here.")
+        return
+
+    task = asyncio.create_task(spam_stats(int(gid), config[gid]["channel_id"], config[gid]["universe_id"]))
+    active_tasks[gid] = task
+    await ctx.reply("✅ Stats updates **started**!")
+
+
+@bot.hybrid_command(name="stop")
+@is_whitelisted()
+async def stop(ctx):
+    """Stop sending stats in this server."""
+    gid = str(ctx.guild.id)
+    if gid in active_tasks:
+        active_tasks[gid].cancel()
+        del active_tasks[gid]
+        await ctx.reply("🛑 Stats updates **stopped**!")
+    else:
+        await ctx.reply("⚠️ No stats running in this server.")
+
+
+@bot.hybrid_command(name="commands")
+@is_whitelisted()
+async def commands_list(ctx):
+    """Show available bot commands."""
+    cmds = [
+        "/setgame <universe_id> - Set which Roblox game to track",
+        "/setchannel - Choose channel for stats",
+        "/start - Start sending stats",
+        "/stop - Stop sending stats",
+        "/commands - Show this list"
+    ]
+    await ctx.reply("📜 **Available Commands:**\n" + "\n".join(cmds))
+
+
+# ---------------- FLASK KEEP-ALIVE ---------------- #
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=8080)
+
+Thread(target=run_flask).start()
+
+# ---------------- RUN ---------------- #
 bot.run(TOKEN)
