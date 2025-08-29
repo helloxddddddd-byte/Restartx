@@ -8,7 +8,6 @@ import requests
 import json
 import os
 import random
-import asyncio
 from flask import Flask
 from threading import Thread
 
@@ -34,7 +33,7 @@ def save_config():
 # === DISCORD SETUP ===
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("!", "/"), intents=intents)
 
 tree = bot.tree  # for slash commands
 
@@ -74,7 +73,7 @@ async def send_game_stats():
             for channel in guild.text_channels:
                 try:
                     await channel.send(msg)
-                    return
+                    return  # only send once per guild
                 except:
                     continue
 
@@ -90,7 +89,7 @@ def is_whitelisted():
 def is_whitelisted_slash(interaction: discord.Interaction):
     return str(interaction.user.id) in config["whitelist"]
 
-# === TEXT COMMANDS (prefix !) ===
+# === TEXT COMMANDS (prefix ! or /) ===
 @bot.command(name="start")
 @is_whitelisted()
 async def start_updates(ctx):
@@ -109,7 +108,7 @@ async def stop_updates(ctx):
 @is_whitelisted()
 async def restart_bot(ctx):
     await ctx.send("🔄 Restarting bot...")
-    await bot.close()
+    os._exit(0)  # force exit so Render restarts it
 
 @bot.command(name="whitelist")
 @is_whitelisted()
@@ -177,7 +176,7 @@ async def restart_slash(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
         return
     await interaction.response.send_message("🔄 Restarting bot...")
-    await bot.close()
+    os._exit(0)
 
 @tree.command(name="whitelist", description="Add a user to whitelist")
 async def whitelist_slash(interaction: discord.Interaction, user_id: str):
