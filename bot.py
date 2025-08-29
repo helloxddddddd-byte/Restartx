@@ -28,52 +28,43 @@ async def fetch_universe_id(place_id):
 
 async def fetch_game_data(universe_id):
     async with aiohttp.ClientSession() as session:
-        # Player count
-        player_url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
-        # Visits
-        detail_url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
-
-        async with session.get(player_url) as p_resp, session.get(detail_url) as d_resp:
-            if p_resp.status == 200 and d_resp.status == 200:
-                pdata = await p_resp.json()
-                ddata = await d_resp.json()
-
-                if "data" in pdata and pdata["data"]:
-                    active_players = pdata["data"][0].get("playing", 0)
-                    visits = pdata["data"][0].get("visits", 0)
+        url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if "data" in data and data["data"]:
+                    active_players = data["data"][0].get("playing", 0)
+                    visits = data["data"][0].get("visits", 0)
                     milestone = visits + 100
-
                     return active_players, visits, milestone
     return None
 
 
-@tasks.loop(seconds=update_interval)
-async def track_game():
-    global current_universe_id, tracking_channel
-    if tracking_channel is None or current_universe_id is None:
-        return
-
-    data = await fetch_game_data(current_universe_id)
-    if data:
-        active_players, visits, milestone = data
-        msg = (
-            "--------------------------------------------------\n"
-            f"👤🎮 Active players: **{active_players}**\n"
-            "--------------------------------------------------\n"
-            f"👥 Visits: **{visits}**\n"
-            f"🎯 Next milestone: **{visits}/{milestone}**\n"
-            "--------------------------------------------------"
-        )
-        await tracking_channel.send(msg)
-    else:
-        await tracking_channel.send("⚠️ Failed to fetch game data.")
+async def tracking_loop():
+    global tracking_channel, current_universe_id, update_interval
+    while True:
+        if tracking_channel and current_universe_id:
+            data = await fetch_game_data(current_universe_id)
+            if data:
+                active_players, visits, milestone = data
+                msg = (
+                    "--------------------------------------------------\n"
+                    f"👤🎮 Active players: **{active_players}**\n"
+                    "--------------------------------------------------\n"
+                    f"👥 Visits: **{visits}**\n"
+                    f"🎯 Next milestone: **{visits}/{milestone}**\n"
+                    "--------------------------------------------------"
+                )
+                await tracking_channel.send(msg)
+            else:
+                await tracking_channel.send("⚠️ Failed to fetch game data.")
+        await asyncio.sleep(update_interval)
 
 
 @bot.event
 async def on_ready():
     global current_universe_id
     print(f"✅ Logged in as {bot.user}")
-    # Get universeId for default game
     current_universe_id = await fetch_universe_id(current_place_id)
     if current_universe_id is None:
         print("❌ Failed to fetch universeId for default game.")
@@ -82,18 +73,20 @@ async def on_ready():
 @bot.command()
 async def start(ctx):
     """Start sending game updates"""
-    global tracking_channel
+    global tracking_channel, tracking_task
     tracking_channel = ctx.channel
-    if not track_game.is_running():
-        track_game.start()
+    if tracking_task is None or tracking_task.done():
+        tracking_task = asyncio.create_task(tracking_loop())
     await ctx.send("✅ Started tracking game data in this channel.")
 
 
 @bot.command()
 async def stop(ctx):
     """Stop sending game updates"""
-    if track_game.is_running():
-        track_game.stop()
+    global tracking_task
+    if tracking_task:
+        tracking_task.cancel()
+        tracking_task = None
     await ctx.send("🛑 Stopped tracking game data.")
 
 
@@ -105,8 +98,6 @@ async def interval(ctx, seconds: int):
         await ctx.send("⚠️ Interval must be at least 30 seconds.")
         return
     update_interval = seconds
-    if track_game.is_running():
-        track_game.change_interval(seconds=update_interval)
     await ctx.send(f"⏱ Interval updated to {update_interval} seconds.")
 
 
@@ -141,7 +132,6 @@ def keep_alive():
     t.start()
 
 keep_alive()
-
 
 # Run bot
 TOKEN = os.getenv("DISCORD_TOKEN")
