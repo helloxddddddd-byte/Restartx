@@ -1,120 +1,120 @@
 import discord
 from discord.ext import commands, tasks
 import aiohttp
+import asyncio
 import os
-import threading
 from flask import Flask
+from threading import Thread
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-# Default game (Vixen Hood)
-DEFAULT_GAME = "125760703264498"
-current_game = DEFAULT_GAME
-update_interval = 65  # seconds
-tracking = False
-tracking_channel = None
-
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# ---------------- Flask keep-alive ----------------
+# ===== Flask Keep-Alive for Render =====
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Bot is alive!"
 
-def run_flask():
+def run():
     app.run(host="0.0.0.0", port=8080)
 
 def keep_alive():
-    t = threading.Thread(target=run_flask)
-    t.start()
+    Thread(target=run).start()
 
+# ===== Discord Bot Setup =====
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------------- Helpers ----------------
-async def fetch_json(url):
+# Default game (Vixen Hood)
+tracked_game = 125760703264498
+update_interval = 65
+tracking = False
+channel_id = None
+
+# ===== Helper: Get Roblox Game Data =====
+async def fetch_game_data(place_id):
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            return None
+        # Fetch active players
+        async with session.get(f"https://games.roblox.com/v1/games?universeIds={place_id}") as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            if not data.get("data"):
+                return None
+            info = data["data"][0]
+            return {
+                "playing": info["playing"],
+                "visits": info["visits"]
+            }
 
-
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
-
-
-# ---------------- Commands ----------------
-@bot.command()
-async def setinterval(ctx, seconds: int):
-    global update_interval
-    if seconds < 15:
-        await ctx.send("⚠️ Interval must be at least 15 seconds.")
-        return
-    update_interval = seconds
-    track_data.change_interval(seconds=update_interval)
-    await ctx.send(f"⏱ Interval updated to {seconds} seconds.")
-
-
-@bot.command()
-async def setgame(ctx, place_id: str):
-    global current_game
-    current_game = place_id
-    await ctx.send(f"🎮 Tracking new game with Place ID `{place_id}`")
-
-
-@bot.command()
-async def start(ctx):
-    global tracking, tracking_channel
-    tracking = True
-    tracking_channel = ctx.channel
-    if not track_data.is_running():
-        track_data.start()
-    await ctx.send("✅ Started tracking game stats!")
-
-
-@bot.command()
-async def stop(ctx):
-    global tracking
-    tracking = False
-    if track_data.is_running():
-        track_data.stop()
-    await ctx.send("🛑 Stopped tracking game stats.")
-
-
-# ---------------- Loop for tracking ----------------
+# ===== Background Task =====
 @tasks.loop(seconds=65)
-async def track_data():
-    global tracking, tracking_channel, current_game
-    if not tracking or not tracking_channel:
+async def send_game_stats():
+    global channel_id, tracked_game
+    if not channel_id or not tracked_game:
         return
 
-    url = f"https://games.roblox.com/v1/games?universeIds={current_game}"
-    data = await fetch_json(url)
-    if not data or "data" not in data or len(data["data"]) == 0:
-        await tracking_channel.send("⚠️ Failed to fetch game data.")
+    channel = bot.get_channel(channel_id)
+    if not channel:
         return
 
-    game_info = data["data"][0]
-    players = game_info.get("playing", 0)
-    visits = game_info.get("visits", 0)
-    milestone = visits + 100
+    data = await fetch_game_data(tracked_game)
+    if not data:
+        await channel.send("⚠️ Failed to fetch game data.")
+        return
 
-    msg = (
+    players = data["playing"]
+    visits = data["visits"]
+    milestone = ((visits // 100) + 1) * 100
+
+    message = (
         "--------------------------------------------------\n"
         f"👤🎮 Active players: **{players}**\n"
         "--------------------------------------------------\n"
         f"👥 Visits: **{visits}**\n"
-        f"🎯 Next milestone: **{visits}/{milestone}**\n"
+        f"🎯 Next milestone: **{milestone}/{visits}**\n"
         "--------------------------------------------------"
     )
+    await channel.send(message)
 
-    await tracking_channel.send(msg)
+# ===== Commands =====
+@bot.command()
+async def start(ctx):
+    global tracking, channel_id
+    if tracking:
+        await ctx.send("⚠️ Tracking is already running!")
+        return
+    channel_id = ctx.channel.id
+    tracking = True
+    send_game_stats.change_interval(seconds=update_interval)
+    send_game_stats.start()
+    await ctx.send("✅ Tracking **started**!")
 
+@bot.command()
+async def stop(ctx):
+    global tracking
+    if not tracking:
+        await ctx.send("⚠️ Tracking is not running.")
+        return
+    tracking = False
+    send_game_stats.stop()
+    await ctx.send("🛑 Tracking **stopped**!")
 
-# ---------------- Run bot ----------------
-keep_alive()  # start Flask keep-alive
-bot.run(TOKEN)
+@bot.command()
+async def setinterval(ctx, seconds: int):
+    global update_interval
+    if seconds < 30:
+        await ctx.send("⚠️ Interval too short! Must be 30s or more.")
+        return
+    update_interval = seconds
+    if tracking:
+        send_game_stats.change_interval(seconds=update_interval)
+    await ctx.send(f"⏱️ Update interval set to **{seconds} seconds**")
+
+@bot.command()
+async def setgame(ctx, place_id: int):
+    global tracked_game
+    tracked_game = place_id
+    await ctx.send(f"🎮 Now tracking game with placeId: **{place_id}**")
+
+# ===== Run Bot =====
+keep_alive()
+bot.run(os.getenv("DISCORD_TOKEN"))
