@@ -2,265 +2,258 @@ import sys, types
 if "audioop" not in sys.modules:
     sys.modules["audioop"] = types.ModuleType("audioop")
 
-import os
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands
-import requests, random, os, json, asyncio
+import requests
+import json
+import os
+import random
+import asyncio
 from flask import Flask
 from threading import Thread
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-OWNER_ID = 893232409489866782  # your Discord ID
-
-# === Persistent Files ===
-WHITELIST_FILE = "whitelist.json"
+# === CONFIG HANDLING ===
 CONFIG_FILE = "config.json"
 
-def load_json(file, default):
-    try:
-        with open(file, "r") as f:
-            return json.load(f)
-    except:
-        return default
+default_config = {
+    "whitelist": ["893232409489866782"],  # Owner user ID always whitelisted
+    "game_id": 123456789  # replace with your Roblox game ID
+}
 
-def save_json(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f)
+if not os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(default_config, f, indent=4)
 
-whitelist = load_json(WHITELIST_FILE, [OWNER_ID])
-CONFIG = load_json(CONFIG_FILE, {"game_id": 12345678, "interval": 65})
+with open(CONFIG_FILE, "r") as f:
+    config = json.load(f)
 
-# === Bot Setup ===
+def save_config():
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+
+# === DISCORD SETUP ===
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
 
-# === Flask Keepalive ===
-app = Flask(__name__)
+tree = bot.tree  # for slash commands
 
-@app.route('/')
-def home():
-    return "Bot is alive!"
+# Track loop state
+sending_updates = True
 
-def run_flask():
-    app.run(host="0.0.0.0", port=8080)
-
-Thread(target=run_flask).start()
-
-# === Whitelist Decorator ===
-def whitelist_only():
-    async def predicate(ctx_or_inter):
-        user_id = ctx_or_inter.user.id if isinstance(ctx_or_inter, discord.Interaction) else ctx_or_inter.author.id
-        if user_id in whitelist:
-            return True
-        if isinstance(ctx_or_inter, discord.Interaction):
-            await ctx_or_inter.response.send_message("❌ You are not whitelisted.", ephemeral=True)
-        else:
-            await ctx_or_inter.send("❌ You are not whitelisted.")
-        return False
-    return commands.check(predicate)
-
-# === Roblox Stats Task ===
-stats_channel = None
-
-@tasks.loop(seconds=CONFIG["interval"])
-async def stats_loop():
-    global stats_channel
-    if not stats_channel:
+# === BACKGROUND TASK ===
+@tasks.loop(seconds=65)
+async def send_game_stats():
+    if not sending_updates:
         return
+
     try:
-        url = f"https://games.roblox.com/v1/games?universeIds={CONFIG['game_id']}"
-        data = requests.get(url).json()
+        game_id = config["game_id"]
+
+        r = requests.get(f"https://games.roblox.com/v1/games?universeIds={game_id}")
+        data = r.json()
+
         if "data" not in data or not data["data"]:
             return
+
         game = data["data"][0]
-        players = game["playing"]
-        visits = game["visits"]
+        active_players = game.get("playing", 0)
+        visits = game.get("visits", 0)
         milestone = visits + 100
 
         msg = (
             "--------------------------------------------------\n"
-            f"👤🎮 Active players: **{players}**\n"
+            f"👤🎮 Active players: **{active_players}**\n"
             "--------------------------------------------------\n"
             f"👥 Visits: **{visits}**\n"
             f"🎯 Next milestone: **{visits}/{milestone}**\n"
             "--------------------------------------------------"
         )
-        await stats_channel.send(msg)
+
+        for guild in bot.guilds:
+            for channel in guild.text_channels:
+                try:
+                    await channel.send(msg)
+                    return
+                except:
+                    continue
+
     except Exception as e:
-        print(f"[ERROR] {e}")
+        print("Error in stats loop:", e)
 
-# === On Ready ===
-@bot.event
-async def on_ready():
-    await tree.sync()
-    print(f"✅ Logged in as {bot.user}")
+# === WHITELIST CHECK ===
+def is_whitelisted():
+    async def predicate(ctx):
+        return str(ctx.author.id) in config["whitelist"]
+    return commands.check(predicate)
 
-# === HELP Command ===
-@tree.command(name="help", description="Show available commands")
-async def slash_help(interaction: discord.Interaction):
-    help_text = (
-        "**📚 Available Commands:**\n"
-        "`/start` `/stop` `/restart` `/status`\n"
-        "`/setinterval <seconds>` `/setgameid <id>` `/showconfig`\n"
-        "`/whitelist <id>` `/unwhitelist <id>` `/whitelistlist`\n"
-        "All also work with `!` prefix."
-    )
-    await interaction.response.send_message(help_text)
+def is_whitelisted_slash(interaction: discord.Interaction):
+    return str(interaction.user.id) in config["whitelist"]
 
-@bot.command(name="help")
-async def prefix_help(ctx):
-    help_text = (
-        "**📚 Available Commands:**\n"
-        "`!start` `!stop` `!restart` `!status`\n"
-        "`!setinterval <seconds>` `!setgameid <id>` `!showconfig`\n"
-        "`!whitelist <id>` `!unwhitelist <id>` `!whitelistlist`\n"
-        "All also work with `/` slash commands."
-    )
-    await ctx.send(help_text)
-
-# === CORE COMMANDS ===
-@tree.command(name="start", description="Start stats loop")
-@whitelist_only()
-async def start(interaction: discord.Interaction):
-    global stats_channel
-    stats_channel = interaction.channel
-    if not stats_loop.is_running():
-        stats_loop.start()
-    await interaction.response.send_message("✅ Stats loop started in this channel.")
-
+# === TEXT COMMANDS (prefix !) ===
 @bot.command(name="start")
-@whitelist_only()
-async def start_prefix(ctx):
-    global stats_channel
-    stats_channel = ctx.channel
-    if not stats_loop.is_running():
-        stats_loop.start()
-    await ctx.send("✅ Stats loop started in this channel.")
-
-@tree.command(name="stop", description="Stop stats loop")
-@whitelist_only()
-async def stop(interaction: discord.Interaction):
-    if stats_loop.is_running():
-        stats_loop.stop()
-    await interaction.response.send_message("🛑 Stats loop stopped.")
+@is_whitelisted()
+async def start_updates(ctx):
+    global sending_updates
+    sending_updates = True
+    await ctx.send("✅ Stats updates **started**!")
 
 @bot.command(name="stop")
-@whitelist_only()
-async def stop_prefix(ctx):
-    if stats_loop.is_running():
-        stats_loop.stop()
-    await ctx.send("🛑 Stats loop stopped.")
-
-@tree.command(name="restart", description="Restart the bot")
-@whitelist_only()
-async def restart(interaction: discord.Interaction):
-    await interaction.response.send_message("♻️ Restarting...")
-    await bot.close()
+@is_whitelisted()
+async def stop_updates(ctx):
+    global sending_updates
+    sending_updates = False
+    await ctx.send("⏹️ Stats updates **stopped**!")
 
 @bot.command(name="restart")
-@whitelist_only()
-async def restart_prefix(ctx):
-    await ctx.send("♻️ Restarting...")
+@is_whitelisted()
+async def restart_bot(ctx):
+    await ctx.send("🔄 Restarting bot...")
     await bot.close()
 
-@tree.command(name="status", description="Show bot status")
-@whitelist_only()
-async def status(interaction: discord.Interaction):
-    loop_status = "✅ Running" if stats_loop.is_running() else "🛑 Stopped"
-    await interaction.response.send_message(f"🔧 Stats loop: {loop_status}\nGame ID: {CONFIG['game_id']}\nInterval: {CONFIG['interval']}s")
-
-@bot.command(name="status")
-@whitelist_only()
-async def status_prefix(ctx):
-    loop_status = "✅ Running" if stats_loop.is_running() else "🛑 Stopped"
-    await ctx.send(f"🔧 Stats loop: {loop_status}\nGame ID: {CONFIG['game_id']}\nInterval: {CONFIG['interval']}s")
-
-@tree.command(name="setinterval", description="Change stats loop interval")
-@whitelist_only()
-async def setinterval(interaction: discord.Interaction, seconds: int):
-    CONFIG["interval"] = seconds
-    save_json(CONFIG_FILE, CONFIG)
-    if stats_loop.is_running():
-        stats_loop.change_interval(seconds=seconds)
-    await interaction.response.send_message(f"⏱ Interval set to {seconds}s")
-
-@bot.command(name="setinterval")
-@whitelist_only()
-async def setinterval_prefix(ctx, seconds: int):
-    CONFIG["interval"] = seconds
-    save_json(CONFIG_FILE, CONFIG)
-    if stats_loop.is_running():
-        stats_loop.change_interval(seconds=seconds)
-    await ctx.send(f"⏱ Interval set to {seconds}s")
-
-@tree.command(name="setgameid", description="Set the Roblox game universe ID")
-@whitelist_only()
-async def setgameid(interaction: discord.Interaction, universe_id: int):
-    CONFIG["game_id"] = universe_id
-    save_json(CONFIG_FILE, CONFIG)
-    await interaction.response.send_message(f"🎮 Game ID set to {universe_id}")
-
-@bot.command(name="setgameid")
-@whitelist_only()
-async def setgameid_prefix(ctx, universe_id: int):
-    CONFIG["game_id"] = universe_id
-    save_json(CONFIG_FILE, CONFIG)
-    await ctx.send(f"🎮 Game ID set to {universe_id}")
-
-@tree.command(name="showconfig", description="Show current config")
-@whitelist_only()
-async def showconfig(interaction: discord.Interaction):
-    await interaction.response.send_message(f"📊 Config: Game ID={CONFIG['game_id']}, Interval={CONFIG['interval']}s")
-
-@bot.command(name="showconfig")
-@whitelist_only()
-async def showconfig_prefix(ctx):
-    await ctx.send(f"📊 Config: Game ID={CONFIG['game_id']}, Interval={CONFIG['interval']}s")
-
-# === WHITELIST COMMANDS ===
-@tree.command(name="whitelist", description="Add a user ID to whitelist")
-@whitelist_only()
-async def whitelist_add(interaction: discord.Interaction, user_id: int):
-    if user_id not in whitelist:
-        whitelist.append(user_id)
-        save_json(WHITELIST_FILE, whitelist)
-    await interaction.response.send_message(f"✅ {user_id} whitelisted")
-
 @bot.command(name="whitelist")
-@whitelist_only()
-async def whitelist_add_prefix(ctx, user_id: int):
-    if user_id not in whitelist:
-        whitelist.append(user_id)
-        save_json(WHITELIST_FILE, whitelist)
-    await ctx.send(f"✅ {user_id} whitelisted")
+@is_whitelisted()
+async def whitelist_user(ctx, user_id: str):
+    if user_id not in config["whitelist"]:
+        config["whitelist"].append(user_id)
+        save_config()
+        await ctx.send(f"✅ User `{user_id}` added to whitelist.")
+    else:
+        await ctx.send("⚠️ That user is already whitelisted.")
 
-@tree.command(name="unwhitelist", description="Remove a user ID from whitelist")
-@whitelist_only()
-async def whitelist_remove(interaction: discord.Interaction, user_id: int):
-    if user_id in whitelist:
-        whitelist.remove(user_id)
-        save_json(WHITELIST_FILE, whitelist)
-    await interaction.response.send_message(f"❌ {user_id} removed from whitelist")
+@bot.command(name="helpme")
+@is_whitelisted()
+async def helpme(ctx):
+    commands_list = """
+📜 **Available Commands**
+!start — Start updates
+!stop — Stop updates
+!restart — Restart bot
+!whitelist <id> — Add user to whitelist
+!8ball <question> — Ask the magic ball
+!roll — Roll a dice
+!flip — Flip a coin
+    """
+    await ctx.send(commands_list)
 
-@bot.command(name="unwhitelist")
-@whitelist_only()
-async def whitelist_remove_prefix(ctx, user_id: int):
-    if user_id in whitelist:
-        whitelist.remove(user_id)
-        save_json(WHITELIST_FILE, whitelist)
-    await ctx.send(f"❌ {user_id} removed from whitelist")
+@bot.command(name="8ball")
+@is_whitelisted()
+async def eightball(ctx, *, question: str):
+    responses = ["Yes!", "No!", "Maybe...", "Definitely!", "Ask again later."]
+    await ctx.send(f"🎱 {random.choice(responses)}")
 
-@tree.command(name="whitelistlist", description="Show all whitelisted IDs")
-@whitelist_only()
-async def whitelist_list(interaction: discord.Interaction):
-    await interaction.response.send_message("👥 Whitelist: " + ", ".join(map(str, whitelist)))
+@bot.command(name="roll")
+@is_whitelisted()
+async def roll(ctx):
+    await ctx.send(f"🎲 You rolled a {random.randint(1, 6)}!")
 
-@bot.command(name="whitelistlist")
-@whitelist_only()
-async def whitelist_list_prefix(ctx):
-    await ctx.send("👥 Whitelist: " + ", ".join(map(str, whitelist)))
+@bot.command(name="flip")
+@is_whitelisted()
+async def flip(ctx):
+    await ctx.send(f"🪙 {random.choice(['Heads', 'Tails'])}!")
 
-# === Run Bot ===
-bot.run(TOKEN)
+# === SLASH COMMANDS ===
+@tree.command(name="start", description="Start updates")
+async def start_slash(interaction: discord.Interaction):
+    if not is_whitelisted_slash(interaction):
+        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
+        return
+    global sending_updates
+    sending_updates = True
+    await interaction.response.send_message("✅ Stats updates **started**!")
+
+@tree.command(name="stop", description="Stop updates")
+async def stop_slash(interaction: discord.Interaction):
+    if not is_whitelisted_slash(interaction):
+        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
+        return
+    global sending_updates
+    sending_updates = False
+    await interaction.response.send_message("⏹️ Stats updates **stopped**!")
+
+@tree.command(name="restart", description="Restart the bot")
+async def restart_slash(interaction: discord.Interaction):
+    if not is_whitelisted_slash(interaction):
+        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
+        return
+    await interaction.response.send_message("🔄 Restarting bot...")
+    await bot.close()
+
+@tree.command(name="whitelist", description="Add a user to whitelist")
+async def whitelist_slash(interaction: discord.Interaction, user_id: str):
+    if not is_whitelisted_slash(interaction):
+        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
+        return
+    if user_id not in config["whitelist"]:
+        config["whitelist"].append(user_id)
+        save_config()
+        await interaction.response.send_message(f"✅ User `{user_id}` added to whitelist.")
+    else:
+        await interaction.response.send_message("⚠️ That user is already whitelisted.")
+
+@tree.command(name="helpme", description="Show commands")
+async def helpme_slash(interaction: discord.Interaction):
+    if not is_whitelisted_slash(interaction):
+        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
+        return
+    commands_list = """
+📜 **Available Commands**
+/start — Start updates
+/stop — Stop updates
+/restart — Restart bot
+/whitelist <id> — Add user to whitelist
+/8ball <question> — Ask the magic ball
+/roll — Roll a dice
+/flip — Flip a coin
+    """
+    await interaction.response.send_message(commands_list)
+
+@tree.command(name="8ball", description="Ask the magic 8-ball")
+async def eightball_slash(interaction: discord.Interaction, question: str):
+    if not is_whitelisted_slash(interaction):
+        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
+        return
+    responses = ["Yes!", "No!", "Maybe...", "Definitely!", "Ask again later."]
+    await interaction.response.send_message(f"🎱 {random.choice(responses)}")
+
+@tree.command(name="roll", description="Roll a dice")
+async def roll_slash(interaction: discord.Interaction):
+    if not is_whitelisted_slash(interaction):
+        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🎲 You rolled a {random.randint(1, 6)}!")
+
+@tree.command(name="flip", description="Flip a coin")
+async def flip_slash(interaction: discord.Interaction):
+    if not is_whitelisted_slash(interaction):
+        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🪙 {random.choice(['Heads', 'Tails'])}!")
+
+# === FLASK KEEPALIVE ===
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_web():
+    app.run(host="0.0.0.0", port=8080)
+
+def keep_alive():
+    Thread(target=run_web).start()
+
+# === EVENTS ===
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
+    try:
+        synced = await tree.sync()
+        print(f"📡 Synced {len(synced)} slash commands")
+    except Exception as e:
+        print("Slash sync error:", e)
+    send_game_stats.start()
+
+# === START ===
+keep_alive()
+bot.run(os.getenv("DISCORD_TOKEN"))
