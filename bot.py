@@ -1,3 +1,8 @@
+import sys, types
+if "audioop" not in sys.modules:
+    sys.modules["audioop"] = types.ModuleType("audioop")
+
+import os
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
