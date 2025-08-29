@@ -1,14 +1,11 @@
 import discord
 from discord.ext import commands, tasks
 import aiohttp
-import asyncio
-import json
 import os
+import json
 
-# Token is now read from Render/Heroku secret
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Always intents
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -16,7 +13,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 WHITELIST_FILE = "whitelist.json"
 SETTINGS_FILE = "serversettings.json"
 
-# Load whitelist
+# --- Persistent Whitelist ---
 if os.path.exists(WHITELIST_FILE):
     with open(WHITELIST_FILE, "r") as f:
         whitelist = json.load(f)
@@ -25,7 +22,7 @@ else:
     with open(WHITELIST_FILE, "w") as f:
         json.dump(whitelist, f)
 
-# Load server settings
+# --- Persistent Server Settings ---
 if os.path.exists(SETTINGS_FILE):
     with open(SETTINGS_FILE, "r") as f:
         server_settings = json.load(f)
@@ -36,6 +33,18 @@ else:
 
 active_servers = set()
 
+def save_whitelist():
+    with open(WHITELIST_FILE, "w") as f:
+        json.dump(whitelist, f)
+
+def save_settings():
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(server_settings, f)
+
+def is_whitelisted(user_id: int) -> bool:
+    return user_id in whitelist
+
+# --- Roblox Game Stats ---
 async def fetch_game_stats(place_id):
     url = f"https://games.roblox.com/v1/games?universeIds={place_id}"
     async with aiohttp.ClientSession() as session:
@@ -47,7 +56,6 @@ async def fetch_game_stats(place_id):
                     visits = game_data.get("visits", 0)
                     playing = game_data.get("playing", 0)
                     return {
-                        "name": game_data.get("name", "Unknown"),
                         "visits": visits,
                         "playing": playing,
                         "goal": visits + 100
@@ -78,33 +86,18 @@ async def spam_stats():
                 f"🎯 Next milestone: **{stats['visits']:,}/{stats['goal']:,}**\n"
                 "--------------------------------------------------"
             )
-            try:
-                await channel.send(msg)
-            except Exception as e:
-                print(f"Error sending message in {guild_id}: {e}")
+            await channel.send(msg)
 
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
     spam_stats.start()
 
-def save_whitelist():
-    with open(WHITELIST_FILE, "w") as f:
-        json.dump(whitelist, f)
-
-def save_settings():
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(server_settings, f)
-
-def is_whitelisted():
-    async def predicate(ctx):
-        return ctx.author.id in whitelist
-    return commands.check(predicate)
-
-# ===== WHITELIST COMMANDS =====
+# --- WHITELIST COMMANDS ---
 @bot.command()
-@is_whitelisted()
 async def whitelist_add(ctx, user_id: int):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted.")
     if user_id not in whitelist:
         whitelist.append(user_id)
         save_whitelist()
@@ -113,8 +106,9 @@ async def whitelist_add(ctx, user_id: int):
         await ctx.send("⚠️ That user is already whitelisted.")
 
 @bot.command()
-@is_whitelisted()
 async def whitelist_remove(ctx, user_id: int):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted.")
     if user_id in whitelist and user_id != 893232409489866782:
         whitelist.remove(user_id)
         save_whitelist()
@@ -124,12 +118,15 @@ async def whitelist_remove(ctx, user_id: int):
 
 @bot.command()
 async def whitelist_list(ctx):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted.")
     await ctx.send(f"👑 Whitelisted users: {', '.join(map(str, whitelist))}")
 
-# ===== SERVER SETTINGS =====
+# --- SERVER SETTINGS ---
 @bot.command()
-@is_whitelisted()
 async def setgame(ctx, place_id: int):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted.")
     gid = str(ctx.guild.id)
     if gid not in server_settings:
         server_settings[gid] = {}
@@ -138,8 +135,9 @@ async def setgame(ctx, place_id: int):
     await ctx.send(f"✅ Game set to `{place_id}` for this server.")
 
 @bot.command()
-@is_whitelisted()
 async def setchannel(ctx):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted.")
     gid = str(ctx.guild.id)
     if gid not in server_settings:
         server_settings[gid] = {}
@@ -147,17 +145,35 @@ async def setchannel(ctx):
     save_settings()
     await ctx.send(f"✅ Stats will now be sent in {ctx.channel.mention}")
 
-# ===== CONTROL =====
+# --- CONTROL ---
 @bot.command()
-@is_whitelisted()
 async def start(ctx):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted.")
     active_servers.add(ctx.guild.id)
     await ctx.send("▶️ Started sending game stats for this server.")
 
 @bot.command()
-@is_whitelisted()
 async def stop(ctx):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted.")
     active_servers.discard(ctx.guild.id)
     await ctx.send("⏹️ Stopped sending game stats for this server.")
+
+# --- COMMAND LIST ---
+@bot.command()
+async def commands_list(ctx):
+    if not is_whitelisted(ctx.author.id):
+        return await ctx.send("❌ You are not whitelisted.")
+    cmds = [
+        "!whitelist_add <user_id>",
+        "!whitelist_remove <user_id>",
+        "!whitelist_list",
+        "!setgame <place_id>",
+        "!setchannel",
+        "!start",
+        "!stop",
+    ]
+    await ctx.send("📜 Available commands:\n" + "\n".join(cmds))
 
 bot.run(TOKEN)
