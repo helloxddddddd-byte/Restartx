@@ -1,157 +1,81 @@
-import sys, types
-if "audioop" not in sys.modules:
-    sys.modules["audioop"] = types.ModuleType("audioop")
-
+import os
+import asyncio
+import aiohttp
 import discord
 from discord.ext import commands, tasks
-import requests
-import json
-import os
-import random
-from flask import Flask
-from threading import Thread
 
-# === CONFIG HANDLING ===
-CONFIG_FILE = "config.json"
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = int(os.getenv("GUILD_ID"))  # server where slash cmds sync
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))  # channel for updates
+PLACE_ID = int(os.getenv("PLACE_ID"))  # your game's placeId
+UNIVERSE_ID = int(os.getenv("UNIVERSE_ID"))  # your game's universeId
+WHITELIST = set(int(x) for x in os.getenv("WHITELIST", "").split(",") if x)
 
-default_config = {
-    "whitelist": ["893232409489866782"],  # Owner user ID always whitelisted
-    "game_id": 123456789  # replace with your Roblox game ID
-}
-
-if not os.path.exists(CONFIG_FILE):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(default_config, f, indent=4)
-
-with open(CONFIG_FILE, "r") as f:
-    config = json.load(f)
-
-def save_config():
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=4)
-
-# === DISCORD SETUP ===
 intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix=commands.when_mentioned_or("!", "/"), intents=intents)
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("/", "!"), intents=intents)
+tree = bot.tree
 
-tree = bot.tree  # for slash commands
+sending_updates = False
+session: aiohttp.ClientSession = None
 
-# Track loop state
-sending_updates = True
+# -------- Roblox API Helpers -------- #
+async def get_game_stats():
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
 
-# === BACKGROUND TASK ===
+    # Visits
+    visits = 0
+    async with session.get(f"https://games.roblox.com/v1/games?universeIds={UNIVERSE_ID}") as r:
+        if r.status == 200:
+            data = await r.json()
+            if "data" in data and len(data["data"]) > 0:
+                visits = data["data"][0]["visits"]
+
+    # Players across all servers
+    players = 0
+    cursor = ""
+    while True:
+        url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public?sortOrder=Asc&limit=100"
+        if cursor:
+            url += f"&cursor={cursor}"
+        async with session.get(url) as r:
+            if r.status != 200:
+                break
+            data = await r.json()
+            for server in data.get("data", []):
+                players += server.get("playing", 0)
+            cursor = data.get("nextPageCursor")
+            if not cursor:
+                break
+        await asyncio.sleep(1)  # ✅ avoid hammering Roblox
+
+    return visits, players
+
+# -------- Background Loop -------- #
 @tasks.loop(seconds=65)
-async def send_game_stats():
+async def post_stats():
     if not sending_updates:
         return
-
     try:
-        game_id = config["game_id"]
-
-        r = requests.get(f"https://games.roblox.com/v1/games?universeIds={game_id}")
-        data = r.json()
-
-        if "data" not in data or not data["data"]:
-            return
-
-        game = data["data"][0]
-        active_players = game.get("playing", 0)
-        visits = game.get("visits", 0)
-        milestone = visits + 100
-
-        msg = (
-            "--------------------------------------------------\n"
-            f"👤🎮 Active players: **{active_players}**\n"
-            "--------------------------------------------------\n"
-            f"👥 Visits: **{visits}**\n"
-            f"🎯 Next milestone: **{visits}/{milestone}**\n"
-            "--------------------------------------------------"
-        )
-
-        for guild in bot.guilds:
-            for channel in guild.text_channels:
-                try:
-                    await channel.send(msg)
-                    return  # only send once per guild
-                except:
-                    continue
-
+        visits, players = await get_game_stats()
+        channel = bot.get_channel(CHANNEL_ID)
+        if channel:
+            milestone = visits + 100
+            await channel.send(
+                f"📊 **Game Stats**\n"
+                f"👥 Players Online: **{players}**\n"
+                f"👣 Total Visits: **{visits}**\n"
+                f"🎯 Next Milestone: **{milestone}**"
+            )
     except Exception as e:
-        print("Error in stats loop:", e)
+        print(f"Error posting stats: {e}")
 
-# === WHITELIST CHECK ===
-def is_whitelisted():
-    async def predicate(ctx):
-        return str(ctx.author.id) in config["whitelist"]
-    return commands.check(predicate)
+# -------- Whitelist Helpers -------- #
+def is_whitelisted_slash(interaction: discord.Interaction) -> bool:
+    return interaction.user.id in WHITELIST
 
-def is_whitelisted_slash(interaction: discord.Interaction):
-    return str(interaction.user.id) in config["whitelist"]
-
-# === TEXT COMMANDS (prefix ! or /) ===
-@bot.command(name="start")
-@is_whitelisted()
-async def start_updates(ctx):
-    global sending_updates
-    sending_updates = True
-    await ctx.send("✅ Stats updates **started**!")
-
-@bot.command(name="stop")
-@is_whitelisted()
-async def stop_updates(ctx):
-    global sending_updates
-    sending_updates = False
-    await ctx.send("⏹️ Stats updates **stopped**!")
-
-@bot.command(name="restart")
-@is_whitelisted()
-async def restart_bot(ctx):
-    await ctx.send("🔄 Restarting bot...")
-    os._exit(0)  # force exit so Render restarts it
-
-@bot.command(name="whitelist")
-@is_whitelisted()
-async def whitelist_user(ctx, user_id: str):
-    if user_id not in config["whitelist"]:
-        config["whitelist"].append(user_id)
-        save_config()
-        await ctx.send(f"✅ User `{user_id}` added to whitelist.")
-    else:
-        await ctx.send("⚠️ That user is already whitelisted.")
-
-@bot.command(name="helpme")
-@is_whitelisted()
-async def helpme(ctx):
-    commands_list = """
-📜 **Available Commands**
-!start — Start updates
-!stop — Stop updates
-!restart — Restart bot
-!whitelist <id> — Add user to whitelist
-!8ball <question> — Ask the magic ball
-!roll — Roll a dice
-!flip — Flip a coin
-    """
-    await ctx.send(commands_list)
-
-@bot.command(name="8ball")
-@is_whitelisted()
-async def eightball(ctx, *, question: str):
-    responses = ["Yes!", "No!", "Maybe...", "Definitely!", "Ask again later."]
-    await ctx.send(f"🎱 {random.choice(responses)}")
-
-@bot.command(name="roll")
-@is_whitelisted()
-async def roll(ctx):
-    await ctx.send(f"🎲 You rolled a {random.randint(1, 6)}!")
-
-@bot.command(name="flip")
-@is_whitelisted()
-async def flip(ctx):
-    await ctx.send(f"🪙 {random.choice(['Heads', 'Tails'])}!")
-
-# === SLASH COMMANDS ===
+# -------- Slash Commands -------- #
 @tree.command(name="start", description="Start updates")
 async def start_slash(interaction: discord.Interaction):
     if not is_whitelisted_slash(interaction):
@@ -159,7 +83,8 @@ async def start_slash(interaction: discord.Interaction):
         return
     global sending_updates
     sending_updates = True
-    await interaction.response.send_message("✅ Stats updates **started**!")
+    await interaction.response.defer()
+    await interaction.followup.send("✅ Stats updates **started**!")
 
 @tree.command(name="stop", description="Stop updates")
 async def stop_slash(interaction: discord.Interaction):
@@ -168,91 +93,52 @@ async def stop_slash(interaction: discord.Interaction):
         return
     global sending_updates
     sending_updates = False
-    await interaction.response.send_message("⏹️ Stats updates **stopped**!")
+    await interaction.response.defer()
+    await interaction.followup.send("🛑 Stats updates **stopped**.")
 
-@tree.command(name="restart", description="Restart the bot")
+@tree.command(name="restart", description="Restart updates")
 async def restart_slash(interaction: discord.Interaction):
     if not is_whitelisted_slash(interaction):
         await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
         return
-    await interaction.response.send_message("🔄 Restarting bot...")
-    os._exit(0)
+    global sending_updates
+    sending_updates = False
+    await asyncio.sleep(1)
+    sending_updates = True
+    await interaction.response.defer()
+    await interaction.followup.send("🔄 Stats updates **restarted**.")
 
 @tree.command(name="whitelist", description="Add a user to whitelist")
-async def whitelist_slash(interaction: discord.Interaction, user_id: str):
+async def whitelist_slash(interaction: discord.Interaction, user: discord.User):
     if not is_whitelisted_slash(interaction):
         await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
         return
-    if user_id not in config["whitelist"]:
-        config["whitelist"].append(user_id)
-        save_config()
-        await interaction.response.send_message(f"✅ User `{user_id}` added to whitelist.")
-    else:
-        await interaction.response.send_message("⚠️ That user is already whitelisted.")
+    WHITELIST.add(user.id)
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send(f"✅ {user.mention} added to whitelist.", ephemeral=True)
 
-@tree.command(name="helpme", description="Show commands")
+@tree.command(name="helpme", description="Show available commands")
 async def helpme_slash(interaction: discord.Interaction):
     if not is_whitelisted_slash(interaction):
         await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
         return
-    commands_list = """
-📜 **Available Commands**
-/start — Start updates
-/stop — Stop updates
-/restart — Restart bot
-/whitelist <id> — Add user to whitelist
-/8ball <question> — Ask the magic ball
-/roll — Roll a dice
-/flip — Flip a coin
-    """
-    await interaction.response.send_message(commands_list)
+    await interaction.response.defer(ephemeral=True)
+    cmds = ["/start", "/stop", "/restart", "/whitelist <user>", "/helpme"]
+    await interaction.followup.send("📖 **Available Commands:**\n" + "\n".join(cmds), ephemeral=True)
 
-@tree.command(name="8ball", description="Ask the magic 8-ball")
-async def eightball_slash(interaction: discord.Interaction, question: str):
-    if not is_whitelisted_slash(interaction):
-        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
-        return
-    responses = ["Yes!", "No!", "Maybe...", "Definitely!", "Ask again later."]
-    await interaction.response.send_message(f"🎱 {random.choice(responses)}")
-
-@tree.command(name="roll", description="Roll a dice")
-async def roll_slash(interaction: discord.Interaction):
-    if not is_whitelisted_slash(interaction):
-        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
-        return
-    await interaction.response.send_message(f"🎲 You rolled a {random.randint(1, 6)}!")
-
-@tree.command(name="flip", description="Flip a coin")
-async def flip_slash(interaction: discord.Interaction):
-    if not is_whitelisted_slash(interaction):
-        await interaction.response.send_message("❌ Not whitelisted.", ephemeral=True)
-        return
-    await interaction.response.send_message(f"🪙 {random.choice(['Heads', 'Tails'])}!")
-
-# === FLASK KEEPALIVE ===
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run_web():
-    app.run(host="0.0.0.0", port=8080)
-
-def keep_alive():
-    Thread(target=run_web).start()
-
-# === EVENTS ===
+# -------- Startup -------- #
 @bot.event
 async def on_ready():
+    global session
+    if session is None or session.closed:
+        session = aiohttp.ClientSession()
+    post_stats.start()
+    await tree.sync(guild=discord.Object(id=GUILD_ID))
     print(f"✅ Logged in as {bot.user}")
-    try:
-        synced = await tree.sync()
-        print(f"📡 Synced {len(synced)} slash commands")
-    except Exception as e:
-        print("Slash sync error:", e)
-    send_game_stats.start()
 
-# === START ===
-keep_alive()
-bot.run(os.getenv("DISCORD_TOKEN"))
+async def close_session():
+    global session
+    if session and not session.closed:
+        await session.close()
+
+bot.run(TOKEN)
