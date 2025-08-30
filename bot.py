@@ -122,17 +122,17 @@ async def setgame(ctx, url: str):
     current_game_url = url
     await ctx.send(f"🎮 Now tracking: {url}")
 
-# ---- SLASH COMMAND FOR BADGE ----
+# 
 @bot.tree.command(name="ping", description="Ping command (needed for Active Developer Badge)")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("ping pong faggit")
 
-# ---- ON READY ----
+#
 @bot.event
 async def on_ready():
     await bot.tree.sync()  # sync slash commands
     print(f"✅ Logged in as {bot.user}")
 
-# ---- START ----
+#
 keep_alive()
 bot.run(TOKEN)
